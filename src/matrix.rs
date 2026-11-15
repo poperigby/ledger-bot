@@ -15,7 +15,7 @@ use matrix_sdk::{
     },
     config::SyncSettings,
     ruma::{
-        OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
+        OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, UserId,
         events::room::{
             member::StrippedRoomMemberEvent,
             message::{
@@ -28,7 +28,9 @@ use matrix_sdk::{
     },
     store::RoomLoadSettings,
 };
+use mime::Mime;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
@@ -68,6 +70,11 @@ pub async fn run(config: Config, pool: PgPool) -> anyhow::Result<()> {
         .await?;
 
     authenticate(&client, &config.matrix, &data_dir).await?;
+
+    // Cosmetic, so a failure here should not keep the bot from running.
+    if let Err(error) = sync_profile(&client, &config.matrix, &data_dir).await {
+        warn!(?error, "failed to update Matrix profile");
+    }
 
     let bot_user_id = client
         .user_id()
@@ -157,6 +164,75 @@ async fn authenticate(
     bail!(
         "configure either matrix.access_token with matrix.device_id, LEDGER__MATRIX_ACCESS_TOKEN with matrix.device_id, matrix.password, or LEDGER__MATRIX_PASSWORD"
     );
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AvatarState {
+    sha256: String,
+    mxc_uri: OwnedMxcUri,
+}
+
+async fn sync_profile(
+    client: &Client,
+    config: &MatrixConfig,
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    let account = client.account();
+
+    if let Some(display_name) = &config.display_name
+        && account.get_display_name().await?.as_deref() != Some(display_name.as_str())
+    {
+        account.set_display_name(Some(display_name)).await?;
+        info!(%display_name, "set Matrix display name");
+    }
+
+    let Some(avatar_path) = &config.avatar else {
+        return Ok(());
+    };
+
+    let content_type = avatar_mime(avatar_path)?;
+    let data = fs::read(avatar_path)
+        .with_context(|| format!("failed to read avatar {}", avatar_path.display()))?;
+    let sha256 = format!("{:x}", Sha256::digest(&data));
+
+    // Uploading on every start would pile up copies of the same image in the
+    // homeserver's media repo, so only upload when the file changed or the
+    // avatar was replaced from somewhere else.
+    let current = account.get_avatar_url().await?;
+    let state_path = data_dir.join("avatar-state.json");
+    let unchanged = fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<AvatarState>(&data).ok())
+        .is_some_and(|state| state.sha256 == sha256 && current.as_ref() == Some(&state.mxc_uri));
+    if unchanged {
+        return Ok(());
+    }
+
+    let mxc_uri = account.upload_avatar(&content_type, data).await?;
+    info!(%mxc_uri, path = %avatar_path.display(), "set Matrix avatar");
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&AvatarState { sha256, mxc_uri })?,
+    )
+    .with_context(|| format!("failed to write {}", state_path.display()))?;
+    Ok(())
+}
+
+fn avatar_mime(path: &Path) -> anyhow::Result<Mime> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    Ok(match extension.as_deref() {
+        Some("png") => mime::IMAGE_PNG,
+        Some("jpg" | "jpeg") => mime::IMAGE_JPEG,
+        Some("gif") => mime::IMAGE_GIF,
+        Some("webp") => "image/webp".parse()?,
+        _ => bail!(
+            "unsupported avatar file type {}; use .png, .jpg, .jpeg, .gif, or .webp",
+            path.display()
+        ),
+    })
 }
 
 async fn handle_room_message(
@@ -524,6 +600,18 @@ fn parse_room_ids(values: &[String]) -> anyhow::Result<Vec<OwnedRoomId>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picks_avatar_mime_from_extension() {
+        assert_eq!(avatar_mime(Path::new("a.PNG")).unwrap(), mime::IMAGE_PNG);
+        assert_eq!(avatar_mime(Path::new("a.jpeg")).unwrap(), mime::IMAGE_JPEG);
+        assert_eq!(
+            avatar_mime(Path::new("a.webp")).unwrap().essence_str(),
+            "image/webp"
+        );
+        assert!(avatar_mime(Path::new("a.bmp")).is_err());
+        assert!(avatar_mime(Path::new("avatar")).is_err());
+    }
 
     #[test]
     fn formats_cents() {

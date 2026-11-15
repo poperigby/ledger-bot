@@ -24,6 +24,8 @@ pub struct MatrixConfig {
     pub store_passphrase: Option<SecretSource>,
     pub allowed_inviter_mxids: Vec<String>,
     pub allowed_room_ids: Vec<String>,
+    pub display_name: Option<String>,
+    pub avatar: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +62,8 @@ struct FileMatrixConfig {
     allowed_inviter_mxids: Vec<String>,
     #[serde(default)]
     allowed_room_ids: Vec<String>,
+    display_name: Option<String>,
+    avatar: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,6 +130,8 @@ impl FileConfig {
                     .or_else(|| env.matrix_store_passphrase.map(SecretSource::Value)),
                 allowed_inviter_mxids: self.matrix.allowed_inviter_mxids,
                 allowed_room_ids: self.matrix.allowed_room_ids,
+                display_name: self.matrix.display_name,
+                avatar: self.matrix.avatar,
             },
             postgres: PostgresConfig {
                 database_url: self
@@ -226,6 +232,8 @@ data_dir = "/tmp/ledger-bot"
 homeserver_url = "https://matrix.example"
 user_id = "@ledger:example"
 allowed_room_ids = ["!room:example"]
+display_name = "Ledger"
+avatar = "/etc/ledger-bot/avatar.png"
 
 [matrix.access_token]
 file = "/run/secrets/ledger-bot/matrix-access-token"
@@ -240,6 +248,11 @@ max_connections = 10
         assert_eq!(config.postgres.max_connections, 10);
         assert_eq!(config.matrix.allowed_room_ids, ["!room:example"]);
         assert!(config.postgres.database_url.is_none());
+        assert_eq!(config.matrix.display_name.as_deref(), Some("Ledger"));
+        assert_eq!(
+            config.matrix.avatar.as_deref(),
+            Some(Path::new("/etc/ledger-bot/avatar.png"))
+        );
     }
 
     #[test]

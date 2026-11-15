@@ -94,6 +94,16 @@ or:
 LEDGER__MATRIX_STORE_PASSPHRASE=...
 ```
 
+Optional bot profile, applied on every startup:
+
+```toml
+[matrix]
+display_name = "Ledger"
+avatar = "/etc/ledger-bot/avatar.png"
+```
+
+The avatar can be PNG, JPEG, GIF, or WebP. It is only re-uploaded when the file's contents change (tracked in `data_dir/avatar-state.json`) or when the account's avatar was changed elsewhere.
+
 See `config.example.toml` for a complete example.
 
 ## NixOS

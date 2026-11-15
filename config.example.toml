@@ -15,6 +15,11 @@ device_id = "REPLACEDEVICE"
 allowed_inviter_mxids = ["@admin:example"]
 allowed_room_ids = ["!room:example"]
 
+# Optional bot profile, applied on startup. The avatar is only re-uploaded
+# when the file changes. Supported formats: PNG, JPEG, GIF, WebP.
+#display_name = "Ledger"
+#avatar = "/etc/ledger-bot/avatar.png"
+
 [matrix.access_token]
 file = "/run/secrets/ledger-bot/matrix-access-token"
 
