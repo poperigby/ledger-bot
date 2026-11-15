@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Check formatting
+        run: nix develop --command cargo fmt --check
+
+      - name: Run clippy
+        run: nix develop --command cargo clippy --locked -- -D warnings
+
+      - name: Run tests
+        run: nix develop --command cargo test --locked
+
+      - name: Check flake
+        run: nix flake check

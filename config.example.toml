@@ -1,0 +1,32 @@
+data_dir = "/var/lib/ledger-bot"
+
+[matrix]
+homeserver_url = "https://matrix.example"
+user_id = "@ledger-bot:example"
+
+# Use either access_token with device_id, or password login.
+# Instead of the secret-file tables below, set LEDGER__MATRIX_ACCESS_TOKEN
+# or LEDGER__MATRIX_PASSWORD in the process environment.
+# Set LEDGER__MATRIX_STORE_PASSPHRASE or matrix.store_passphrase to encrypt
+# the Matrix SDK SQLite store under data_dir/matrix-store.
+device_id = "REPLACEDEVICE"
+
+# Empty lists allow any inviter or joined room. Fill these in for production.
+allowed_inviter_mxids = ["@admin:example"]
+allowed_room_ids = ["!room:example"]
+
+[matrix.access_token]
+file = "/run/secrets/ledger-bot/matrix-access-token"
+
+#[matrix.password]
+#file = "/run/secrets/ledger-bot/matrix-password"
+
+#[matrix.store_passphrase]
+#file = "/run/secrets/ledger-bot/matrix-store-passphrase"
+
+[postgres]
+# Instead of this secret-file table, set LEDGER__POSTGRES_DATABASE_URL.
+max_connections = 5
+
+[postgres.database_url]
+file = "/run/secrets/ledger-bot/database-url"
