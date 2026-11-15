@@ -38,7 +38,7 @@
 
             meta = {
               description = "Matrix ledger bot backed by PostgreSQL";
-              license = pkgs.lib.licenses.mit;
+              license = pkgs.lib.licenses.gpl3Plus;
               mainProgram = "ledger-bot";
             };
           };
