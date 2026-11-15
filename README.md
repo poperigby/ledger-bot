@@ -68,6 +68,8 @@ or:
 LEDGER__MATRIX_PASSWORD=...
 ```
 
+On startup the bot sets up cross-signing for its account if it has none, so clients stop showing its messages as sent from an unverified device. If the homeserver requires interactive auth for that, the bot uses the password, even when an access token is configured. Without a password it logs a warning and keeps running. Once cross-signing is set up, the password can be removed again.
+
 Postgres database URL:
 
 ```toml

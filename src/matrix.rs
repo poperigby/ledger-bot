@@ -16,6 +16,7 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, UserId,
+        api::client::uiaa,
         events::room::{
             member::StrippedRoomMemberEvent,
             message::{
@@ -70,6 +71,12 @@ pub async fn run(config: Config, pool: PgPool) -> anyhow::Result<()> {
         .await?;
 
     authenticate(&client, &config.matrix, &data_dir).await?;
+
+    // Without cross-signing, clients flag every message the bot sends as coming
+    // from an unverified device. That is a warning, not a failure, so keep running.
+    if let Err(error) = bootstrap_cross_signing(&client, &config.matrix).await {
+        warn!(?error, "failed to set up cross-signing");
+    }
 
     // Cosmetic, so a failure here should not keep the bot from running.
     if let Err(error) = sync_profile(&client, &config.matrix, &data_dir).await {
@@ -164,6 +171,50 @@ async fn authenticate(
     bail!(
         "configure either matrix.access_token with matrix.device_id, LEDGER__MATRIX_ACCESS_TOKEN with matrix.device_id, matrix.password, or LEDGER__MATRIX_PASSWORD"
     );
+}
+
+/// Creates and uploads cross-signing keys if the account has none, which also
+/// signs the bot's current device with them. Does nothing if the account
+/// already has cross-signing keys.
+async fn bootstrap_cross_signing(client: &Client, config: &MatrixConfig) -> anyhow::Result<()> {
+    let encryption = client.encryption();
+
+    // Some servers allow the first upload of an account's cross-signing keys
+    // without interactive auth (MSC3967).
+    let error = match encryption.bootstrap_cross_signing_if_needed(None).await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let Some(uiaa) = error.as_uiaa_response() else {
+        return Err(error.into());
+    };
+
+    let Some(password) = resolve_optional_secret(config.password.as_ref(), "matrix.password")?
+    else {
+        warn!(
+            "could not set up cross-signing: the homeserver requires interactive auth to upload \
+             cross-signing keys. Configure matrix.password or LEDGER__MATRIX_PASSWORD for a \
+             one-time bootstrap; it can be removed once cross-signing is set up. Until then, \
+             clients will show the bot's messages as sent from an unverified device"
+        );
+        return Ok(());
+    };
+
+    let user_id = client
+        .user_id()
+        .context("client has no user ID after authentication")?;
+    let mut auth = uiaa::Password::new(
+        uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier::new(user_id.to_string())),
+        password,
+    );
+    auth.session = uiaa.session.clone();
+
+    encryption
+        .bootstrap_cross_signing_if_needed(Some(uiaa::AuthData::Password(auth)))
+        .await
+        .context("failed to upload cross-signing keys with password auth")?;
+    info!("set up cross-signing");
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
