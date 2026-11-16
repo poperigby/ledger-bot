@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -8,7 +9,7 @@ use std::{
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use matrix_sdk::{
-    Client, Room, RoomState,
+    Client, Room, RoomMemberships, RoomState,
     authentication::{
         SessionTokens,
         matrix::{MatrixSession, MatrixSession as PersistedMatrixSession},
@@ -18,9 +19,10 @@ use matrix_sdk::{
         OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, UserId,
         api::client::uiaa,
         events::room::{
-            member::StrippedRoomMemberEvent,
+            member::{MembershipState, StrippedRoomMemberEvent},
             message::{
-                MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+                MessageFormat, MessageType, OriginalSyncRoomMessageEvent, Relation,
+                RoomMessageEventContent,
             },
             redaction::OriginalSyncRoomRedactionEvent,
         },
@@ -38,7 +40,7 @@ use tracing::{error, info, warn};
 use crate::{
     config::{Config, MatrixConfig, resolve_optional_secret},
     ledger::{self, Balance, LedgerEntry},
-    parser::{BotCommand, LedgerKind, parse_command},
+    parser::{BotCommand, ParseError, parse_command},
 };
 
 #[derive(Clone)]
@@ -298,7 +300,7 @@ async fn handle_room_message(
         // redelivered. Tell the sender instead of silently dropping a command.
         let (body, _) = message_body_and_replacement(&ev.content);
         if state.should_process_room(room.room_id())
-            && body.is_some_and(|body| parse_command(body).is_ok())
+            && body.is_some_and(|body| parse_command(&body).is_ok())
             && let Err(error) = reply(
                 &room,
                 "Something went wrong processing that command. Check !balance before sending it again.",
@@ -337,22 +339,32 @@ async fn process_room_message(
         return Ok(());
     }
 
-    let command = match parse_command(body) {
+    let command = match parse_command(&body) {
         Ok(command) => command,
-        Err(error) if body.trim_start().starts_with('!') => {
+        Err(ParseError::NotACommand) => return Ok(()),
+        Err(error) => {
             reply(room, format!("Could not parse ledger command: {error}")).await?;
             return Ok(());
         }
-        Err(_) => return Ok(()),
     };
 
     let command = match command {
         BotCommand::Entry(command) => command,
-        BotCommand::Balance { counterparty_mxid } => {
+        BotCommand::Balance { user } => {
+            let user = match user {
+                Some(raw) => match resolve_user(room, &raw, &state.bot_user_id, false).await? {
+                    Ok(user_id) => Some(user_id),
+                    Err(message) => {
+                        reply(room, message).await?;
+                        return Ok(());
+                    }
+                },
+                None => None,
+            };
             let balances = ledger::balances(&state.pool, room_id.as_str()).await?;
             reply(
                 room,
-                format_balances(&balances, counterparty_mxid.as_deref()),
+                format_balances(&balances, user.as_ref().map(|user| user.as_str())),
             )
             .await?;
             return Ok(());
@@ -363,11 +375,47 @@ async fn process_room_message(
         }
     };
 
+    // Whichever side the command leaves out is the sender.
+    let mut parties = Vec::with_capacity(2);
+    for raw in [&command.from, &command.to] {
+        let user_id = match raw {
+            Some(raw) => match resolve_user(room, raw, &state.bot_user_id, true).await? {
+                Ok(user_id) => user_id,
+                Err(message) => {
+                    reply(room, message).await?;
+                    return Ok(());
+                }
+            },
+            None => ev.sender.clone(),
+        };
+        parties.push(user_id);
+    }
+    let [from, to] = <[OwnedUserId; 2]>::try_from(parties).expect("two parties");
+    if from == to {
+        reply(
+            room,
+            format!("Both sides of that entry are {from}. Name two different people."),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let created_at = ev
         .origin_server_ts
         .to_system_time()
         .map(DateTime::<Utc>::from)
         .unwrap_or_else(Utc::now);
+    let entry_for = |event_id: &str| LedgerEntry {
+        room_id: room_id.to_string(),
+        matrix_event_id: event_id.to_owned(),
+        kind: command.kind,
+        actor_mxid: ev.sender.to_string(),
+        from_mxid: from.to_string(),
+        to_mxid: to.to_string(),
+        amount_cents: command.amount_cents,
+        description: command.description.clone(),
+        created_at,
+    };
 
     let changed = if let Some(original_event_id) = replaces_event_id {
         // Homeservers do not check that an edit comes from the original sender,
@@ -386,24 +434,12 @@ async fn process_room_message(
             return Ok(());
         }
 
-        let entry = LedgerEntry::from_command(
-            room_id.as_str(),
-            original_event_id.as_str(),
-            ev.sender.as_str(),
-            command,
-            created_at,
-        );
+        let entry = entry_for(original_event_id.as_str());
         ledger::upsert_edited_entry(&state.pool, &entry)
             .await?
             .then_some(entry)
     } else {
-        let entry = LedgerEntry::from_command(
-            room_id.as_str(),
-            ev.event_id.as_str(),
-            ev.sender.as_str(),
-            command,
-            created_at,
-        );
+        let entry = entry_for(ev.event_id.as_str());
         ledger::insert_entry(&state.pool, &entry)
             .await?
             .then_some(entry)
@@ -492,17 +528,24 @@ async fn reply(room: &Room, text: impl Into<String>) -> anyhow::Result<()> {
 }
 
 fn help_text() -> &'static str {
-    "Commands: !purchase @user:server 12.34 description, !payment @user:server 12.34 description, !balance, !balance @user:server"
+    "Commands:\n\
+     @x !owes @y 12.34 description: x owes y\n\
+     @x !owes 12.34 description: x owes you\n\
+     !owes @y 12.34 description: you owe y\n\
+     !paid works the same way, for payments\n\
+     !balance: every balance in this room\n\
+     !balance @x: balances involving x\n\
+     Users can be @user:server, or a bare @user that matches one room member."
 }
 
 fn format_recorded(entry: &LedgerEntry) -> String {
-    let action = match entry.kind {
-        LedgerKind::Purchase => "Purchase",
-        LedgerKind::Payment => "Payment",
-    };
-    let mut message = format!("{action} recorded\n");
-    message.push_str(&format!("User: {}\n", entry.counterparty_mxid));
-    message.push_str(&format!("Amount: {}", format_cents(entry.amount_cents)));
+    let mut message = format!(
+        "Recorded: {} {} {} {}",
+        entry.from_mxid,
+        entry.kind.as_str(),
+        entry.to_mxid,
+        format_cents(entry.amount_cents)
+    );
     if let Some(description) = &entry.description {
         message.push_str("\nDescription: ");
         message.push_str(description);
@@ -510,50 +553,40 @@ fn format_recorded(entry: &LedgerEntry) -> String {
     message
 }
 
-fn format_balances(balances: &[Balance], counterparty_mxid: Option<&str>) -> String {
-    let filtered = balances
+/// Lists who owes whom. With `user`, only pairs involving that user are
+/// shown, including settled ones.
+fn format_balances(balances: &[Balance], user: Option<&str>) -> String {
+    let lines = balances
         .iter()
-        .filter(|balance| {
-            counterparty_mxid
-                .map(|counterparty| balance.counterparty_mxid == counterparty)
-                .unwrap_or(true)
+        .filter(|balance| match user {
+            Some(user) => balance.a_mxid == user || balance.b_mxid == user,
+            None => balance.a_owes_b_cents != 0,
+        })
+        .map(|balance| {
+            let (debtor, creditor) = if balance.a_owes_b_cents >= 0 {
+                (&balance.a_mxid, &balance.b_mxid)
+            } else {
+                (&balance.b_mxid, &balance.a_mxid)
+            };
+            if balance.a_owes_b_cents == 0 {
+                format!("{debtor} and {creditor} are settled up")
+            } else {
+                format!(
+                    "{debtor} owes {creditor} {}",
+                    format_cents(balance.a_owes_b_cents.abs())
+                )
+            }
         })
         .collect::<Vec<_>>();
 
-    if filtered.is_empty() {
-        return match counterparty_mxid {
-            Some(counterparty) => {
-                format!("Balance for {counterparty}\nNo entries recorded.")
-            }
-            None => "Balances\nNo entries recorded.".to_owned(),
-        };
-    }
-
-    let mut message = match counterparty_mxid {
-        Some(counterparty) => format!("Balance for {counterparty}"),
+    let heading = match user {
+        Some(user) => format!("Balances for {user}"),
         None => "Balances".to_owned(),
     };
-    let total = filtered
-        .iter()
-        .map(|balance| balance.balance_cents)
-        .sum::<i64>();
-
-    for balance in filtered {
-        message.push('\n');
-        message.push_str(&format!(
-            "{}  {}  {}",
-            balance_direction(balance.balance_cents),
-            format_cents(balance.balance_cents),
-            balance.counterparty_mxid
-        ));
+    if lines.is_empty() {
+        return format!("{heading}\nNothing owed.");
     }
-
-    if counterparty_mxid.is_none() {
-        message.push('\n');
-        message.push_str(&format!("Total  {}", format_cents(total)));
-    }
-
-    message
+    format!("{heading}\n{}", lines.join("\n"))
 }
 
 fn format_cents(amount_cents: i64) -> String {
@@ -562,33 +595,205 @@ fn format_cents(amount_cents: i64) -> String {
     format!("{sign}${}.{:02}", amount / 100, amount % 100)
 }
 
-fn balance_direction(amount_cents: i64) -> &'static str {
-    match amount_cents.cmp(&0) {
-        std::cmp::Ordering::Greater => "Owed",
-        std::cmp::Ordering::Less => "Paid",
-        std::cmp::Ordering::Equal => "Settled",
+/// Turns a user as typed into a full Matrix ID. A bare `@handle` is looked up
+/// among the room's members. A full ID must also belong to a member when
+/// `require_member` is set, which catches typos before they become entries.
+/// The inner `Err` is a message to show the sender.
+async fn resolve_user(
+    room: &Room,
+    raw: &str,
+    bot_user_id: &UserId,
+    require_member: bool,
+) -> anyhow::Result<Result<OwnedUserId, String>> {
+    if raw.contains(':') {
+        let Ok(user_id) = UserId::parse(raw) else {
+            return Ok(Err(format!("{raw} is not a valid Matrix user ID.")));
+        };
+        if user_id == bot_user_id {
+            return Ok(Err("The bot can't be part of a ledger entry.".to_owned()));
+        }
+        if require_member
+            && room
+                .get_member(&user_id)
+                .await?
+                .is_none_or(|member| !is_active(member.membership()))
+        {
+            return Ok(Err(format!("{user_id} isn't in this room.")));
+        }
+        return Ok(Ok(user_id));
+    }
+
+    let handle = raw.trim_start_matches('@');
+    let members = room.members(RoomMemberships::ACTIVE).await?;
+    Ok(match_member(
+        handle,
+        members
+            .iter()
+            .filter(|member| member.user_id() != bot_user_id)
+            .map(|member| (member.user_id(), member.display_name())),
+    )
+    .map(ToOwned::to_owned))
+}
+
+fn is_active(membership: &MembershipState) -> bool {
+    matches!(membership, MembershipState::Join | MembershipState::Invite)
+}
+
+/// Matches `handle` against member localparts first, then display names,
+/// both case-insensitively. Exactly one match is required.
+fn match_member<'a>(
+    handle: &str,
+    members: impl IntoIterator<Item = (&'a UserId, Option<&'a str>)>,
+) -> Result<&'a UserId, String> {
+    let members: Vec<_> = members.into_iter().collect();
+    let by_localpart: Vec<_> = members
+        .iter()
+        .filter(|(user_id, _)| user_id.localpart().eq_ignore_ascii_case(handle))
+        .map(|(user_id, _)| *user_id)
+        .collect();
+    let matches = if by_localpart.is_empty() {
+        members
+            .iter()
+            .filter(|(_, name)| name.is_some_and(|name| name.eq_ignore_ascii_case(handle)))
+            .map(|(user_id, _)| *user_id)
+            .collect()
+    } else {
+        by_localpart
+    };
+
+    match matches.as_slice() {
+        [user_id] => Ok(user_id),
+        [] => Err(format!(
+            "No one in this room matches @{handle}. Use their full ID, like @{handle}:server."
+        )),
+        several => Err(format!(
+            "@{handle} matches more than one person: {}. Use their full ID.",
+            several
+                .iter()
+                .map(|user_id| user_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
+/// Returns the text to parse and, for an edit, the event it replaces.
 fn message_body_and_replacement(
     content: &RoomMessageEventContent,
-) -> (Option<&str>, Option<&OwnedEventId>) {
+) -> (Option<Cow<'_, str>>, Option<&OwnedEventId>) {
     if let Some(Relation::Replacement(replacement)) = &content.relates_to {
         return (
-            match &replacement.new_content.msgtype {
-                MessageType::Text(text) => Some(text.body.as_str()),
-                MessageType::Notice(notice) => Some(notice.body.as_str()),
-                _ => None,
-            },
+            message_text(&replacement.new_content.msgtype),
             Some(&replacement.event_id),
         );
     }
+    (message_text(&content.msgtype), None)
+}
 
-    match &content.msgtype {
-        MessageType::Text(text) => (Some(text.body.as_str()), None),
-        MessageType::Notice(notice) => (Some(notice.body.as_str()), None),
-        _ => (None, None),
+/// Uses the plain body, unless the HTML body has mention pills. A pill's plain
+/// text is the person's display name, so the HTML is the only place the user
+/// ID survives.
+fn message_text(msgtype: &MessageType) -> Option<Cow<'_, str>> {
+    let (body, formatted) = match msgtype {
+        MessageType::Text(text) => (&text.body, text.formatted.as_ref()),
+        MessageType::Notice(notice) => (&notice.body, notice.formatted.as_ref()),
+        _ => return None,
+    };
+    match formatted {
+        Some(formatted)
+            if formatted.format == MessageFormat::Html
+                && formatted.body.contains("matrix.to/#/") =>
+        {
+            Some(Cow::Owned(html_with_mentions_as_ids(&formatted.body)))
+        }
+        _ => Some(Cow::Borrowed(body)),
     }
+}
+
+/// Flattens message HTML to text, writing each user mention pill as the
+/// user's Matrix ID and dropping any reply fallback.
+fn html_with_mentions_as_ids(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&decode_entities(&rest[..start]));
+        let Some(len) = rest[start..].find('>') else {
+            rest = "";
+            break;
+        };
+        let tag = &rest[start + 1..start + len];
+        rest = &rest[start + len + 1..];
+
+        let closing = tag.starts_with('/');
+        let name = tag
+            .trim_start_matches('/')
+            .split(|ch: char| ch.is_whitespace() || ch == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match name.as_str() {
+            "mx-reply" if !closing => rest = skip_past(rest, "</mx-reply>"),
+            "a" if !closing => {
+                if let Some(user_id) = mention_target(tag) {
+                    // Pad so a pill touching the next word still splits.
+                    out.push_str(&format!(" {user_id} "));
+                    rest = skip_past(rest, "</a>");
+                }
+            }
+            "br" | "p" | "div" | "li" => out.push(' '),
+            _ => {}
+        }
+    }
+    out.push_str(&decode_entities(rest));
+    out
+}
+
+fn skip_past<'a>(text: &'a str, needle: &str) -> &'a str {
+    match text.to_ascii_lowercase().find(needle) {
+        Some(index) => &text[index + needle.len()..],
+        None => "",
+    }
+}
+
+/// The user ID from a `<a href="https://matrix.to/#/@user:server">` tag.
+fn mention_target(tag: &str) -> Option<String> {
+    let href = tag.find("href=").map(|index| &tag[index + 5..])?;
+    let quote = href.chars().next().filter(|ch| *ch == '"' || *ch == '\'')?;
+    let href = &href[1..];
+    let href = &href[..href.find(quote)?];
+    let target = href.strip_prefix("https://matrix.to/#/")?;
+    let target = target.split('?').next()?;
+    let user_id = percent_decode(target)?;
+    UserId::parse(&user_id)
+        .ok()
+        .map(|user_id| user_id.to_string())
+}
+
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = text.get(index + 1..index + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn decode_entities(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 fn load_session(data_dir: &Path) -> anyhow::Result<Option<SessionFile>> {
@@ -653,6 +858,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn matches_member_by_localpart_then_display_name() {
+        let sh = <&UserId>::try_from("@shwilson2:matrix.org").unwrap();
+        let alex = <&UserId>::try_from("@alex:example").unwrap();
+        let alex_other = <&UserId>::try_from("@alex:other").unwrap();
+        let members = [
+            (sh, Some("Shawn")),
+            (alex, None),
+            (alex_other, Some("Alex O")),
+        ];
+
+        assert_eq!(match_member("ShWilson2", members), Ok(sh));
+        assert_eq!(match_member("shawn", members), Ok(sh));
+        assert!(
+            match_member("alex", members)
+                .unwrap_err()
+                .contains("@alex:example, @alex:other")
+        );
+        assert!(
+            match_member("nobody", members)
+                .unwrap_err()
+                .starts_with("No one in this room matches @nobody")
+        );
+    }
+
+    #[test]
     fn picks_avatar_mime_from_extension() {
         assert_eq!(avatar_mime(Path::new("a.PNG")).unwrap(), mime::IMAGE_PNG);
         assert_eq!(avatar_mime(Path::new("a.jpeg")).unwrap(), mime::IMAGE_JPEG);
@@ -670,50 +900,42 @@ mod tests {
         assert_eq!(format_cents(-99), "-$0.99");
     }
 
+    fn balance(a: &str, b: &str, a_owes_b_cents: i64) -> Balance {
+        Balance {
+            a_mxid: a.to_owned(),
+            b_mxid: b.to_owned(),
+            a_owes_b_cents,
+        }
+    }
+
     #[test]
     fn formats_empty_balances() {
-        assert_eq!(format_balances(&[], None), "Balances\nNo entries recorded.");
+        assert_eq!(format_balances(&[], None), "Balances\nNothing owed.");
         assert_eq!(
             format_balances(&[], Some("@alex:example")),
-            "Balance for @alex:example\nNo entries recorded."
+            "Balances for @alex:example\nNothing owed."
         );
     }
 
     #[test]
-    fn filters_balances() {
-        let balances = vec![
-            Balance {
-                counterparty_mxid: "@alex:example".to_owned(),
-                balance_cents: 1234,
-            },
-            Balance {
-                counterparty_mxid: "@blair:example".to_owned(),
-                balance_cents: -500,
-            },
-        ];
-
-        assert_eq!(
-            format_balances(&balances, Some("@blair:example")),
-            "Balance for @blair:example\nPaid  -$5.00  @blair:example"
-        );
-    }
-
-    #[test]
-    fn formats_all_balances_with_total() {
-        let balances = vec![
-            Balance {
-                counterparty_mxid: "@alex:example".to_owned(),
-                balance_cents: 1234,
-            },
-            Balance {
-                counterparty_mxid: "@blair:example".to_owned(),
-                balance_cents: -500,
-            },
+    fn formats_balances_in_both_directions() {
+        let balances = [
+            balance("@alex:example", "@blair:example", 1234),
+            balance("@alex:example", "@casey:example", 0),
+            balance("@blair:example", "@casey:example", -500),
         ];
 
         assert_eq!(
             format_balances(&balances, None),
-            "Balances\nOwed  $12.34  @alex:example\nPaid  -$5.00  @blair:example\nTotal  $7.34"
+            "Balances\n\
+             @alex:example owes @blair:example $12.34\n\
+             @casey:example owes @blair:example $5.00"
+        );
+        assert_eq!(
+            format_balances(&balances, Some("@casey:example")),
+            "Balances for @casey:example\n\
+             @alex:example and @casey:example are settled up\n\
+             @casey:example owes @blair:example $5.00"
         );
     }
 
@@ -722,9 +944,10 @@ mod tests {
         let entry = LedgerEntry {
             room_id: "!room:example".to_owned(),
             matrix_event_id: "$event".to_owned(),
-            kind: LedgerKind::Purchase,
-            actor_mxid: "@buyer:example".to_owned(),
-            counterparty_mxid: "@alex:example".to_owned(),
+            kind: crate::parser::LedgerKind::Owes,
+            actor_mxid: "@blair:example".to_owned(),
+            from_mxid: "@alex:example".to_owned(),
+            to_mxid: "@blair:example".to_owned(),
             amount_cents: 1234,
             description: Some("lunch".to_owned()),
             created_at: Utc::now(),
@@ -732,7 +955,26 @@ mod tests {
 
         assert_eq!(
             format_recorded(&entry),
-            "Purchase recorded\nUser: @alex:example\nAmount: $12.34\nDescription: lunch"
+            "Recorded: @alex:example owes @blair:example $12.34\nDescription: lunch"
+        );
+    }
+
+    #[test]
+    fn replaces_mention_pills_with_user_ids() {
+        let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let html = "<mx-reply><blockquote>earlier</blockquote></mx-reply>\
+                    <a href=\"https://matrix.to/#/%40shwilson2%3Amatrix.org\">Shawn W</a>\
+                    !owes <a href='https://matrix.to/#/@poperigby:matrix.org?via=x'>Cassidy</a> \
+                    24 Soap &amp; deodorant";
+        assert_eq!(
+            normalize(&html_with_mentions_as_ids(html)),
+            "@shwilson2:matrix.org !owes @poperigby:matrix.org 24 Soap & deodorant"
+        );
+        assert_eq!(
+            normalize(&html_with_mentions_as_ids(
+                "<a href=\"https://example.com\">link</a> text"
+            )),
+            "link text"
         );
     }
 }

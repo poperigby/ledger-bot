@@ -1,45 +1,30 @@
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
-use crate::parser::{LedgerCommand, LedgerKind};
+use crate::parser::LedgerKind;
 
+/// One ledger line: `from_mxid` owes, or paid, `to_mxid` the amount.
+/// `actor_mxid` is whoever sent the command, which may be neither party.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerEntry {
     pub room_id: String,
     pub matrix_event_id: String,
     pub kind: LedgerKind,
     pub actor_mxid: String,
-    pub counterparty_mxid: String,
+    pub from_mxid: String,
+    pub to_mxid: String,
     pub amount_cents: i64,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
+/// Net position between two users, with `a_mxid` sorting before `b_mxid`.
+/// Positive means `a` owes `b`; negative means `b` owes `a`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Balance {
-    pub counterparty_mxid: String,
-    pub balance_cents: i64,
-}
-
-impl LedgerEntry {
-    pub fn from_command(
-        room_id: impl Into<String>,
-        matrix_event_id: impl Into<String>,
-        actor_mxid: impl Into<String>,
-        command: LedgerCommand,
-        created_at: DateTime<Utc>,
-    ) -> Self {
-        Self {
-            room_id: room_id.into(),
-            matrix_event_id: matrix_event_id.into(),
-            kind: command.kind,
-            actor_mxid: actor_mxid.into(),
-            counterparty_mxid: command.counterparty_mxid,
-            amount_cents: command.amount_cents,
-            description: command.description,
-            created_at,
-        }
-    }
+    pub a_mxid: String,
+    pub b_mxid: String,
+    pub a_owes_b_cents: i64,
 }
 
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
@@ -49,13 +34,15 @@ create table if not exists ledger_entries (
     id bigserial primary key,
     room_id text not null,
     matrix_event_id text not null unique,
-    kind text not null check (kind in ('purchase', 'payment')),
+    kind text not null check (kind in ('owes', 'paid')),
     actor_mxid text not null,
-    counterparty_mxid text not null,
+    from_mxid text not null,
+    to_mxid text not null,
     amount_cents bigint not null check (amount_cents > 0),
     description text,
     created_at timestamptz not null,
-    redacted boolean not null default false
+    redacted boolean not null default false,
+    check (from_mxid <> to_mxid)
 );
 "#,
     )
@@ -82,7 +69,6 @@ create table if not exists processed_events (
 }
 
 pub async fn insert_entry(pool: &PgPool, entry: &LedgerEntry) -> anyhow::Result<bool> {
-    let kind = entry.kind.as_str();
     let result = sqlx::query(
         r#"
 insert into ledger_entries (
@@ -90,19 +76,21 @@ insert into ledger_entries (
     matrix_event_id,
     kind,
     actor_mxid,
-    counterparty_mxid,
+    from_mxid,
+    to_mxid,
     amount_cents,
     description,
     created_at
-) values ($1, $2, $3, $4, $5, $6, $7, $8)
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 on conflict (matrix_event_id) do nothing
 "#,
     )
     .bind(&entry.room_id)
     .bind(&entry.matrix_event_id)
-    .bind(kind)
+    .bind(entry.kind.as_str())
     .bind(&entry.actor_mxid)
-    .bind(&entry.counterparty_mxid)
+    .bind(&entry.from_mxid)
+    .bind(&entry.to_mxid)
     .bind(entry.amount_cents)
     .bind(&entry.description)
     .bind(entry.created_at)
@@ -184,14 +172,16 @@ insert into ledger_entries (
     matrix_event_id,
     kind,
     actor_mxid,
-    counterparty_mxid,
+    from_mxid,
+    to_mxid,
     amount_cents,
     description,
     created_at
-) values ($1, $2, $3, $4, $5, $6, $7, $8)
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 on conflict (matrix_event_id) do update
 set kind = excluded.kind,
-    counterparty_mxid = excluded.counterparty_mxid,
+    from_mxid = excluded.from_mxid,
+    to_mxid = excluded.to_mxid,
     amount_cents = excluded.amount_cents,
     description = excluded.description
 where ledger_entries.redacted = false
@@ -203,7 +193,8 @@ where ledger_entries.redacted = false
     .bind(&entry.matrix_event_id)
     .bind(entry.kind.as_str())
     .bind(&entry.actor_mxid)
-    .bind(&entry.counterparty_mxid)
+    .bind(&entry.from_mxid)
+    .bind(&entry.to_mxid)
     .bind(entry.amount_cents)
     .bind(&entry.description)
     .bind(entry.created_at)
@@ -213,18 +204,24 @@ where ledger_entries.redacted = false
     Ok(result.rows_affected() == 1)
 }
 
+/// Nets every pair of users in the room. `!owes` moves the debt towards
+/// `from` owing `to`; `!paid` moves it back.
 pub async fn balances(pool: &PgPool, room_id: &str) -> anyhow::Result<Vec<Balance>> {
     let rows = sqlx::query(
         r#"
-select counterparty_mxid,
-       coalesce(sum(case kind
-           when 'purchase' then amount_cents
-           when 'payment' then -amount_cents
-       end), 0) as balance_cents
-from ledger_entries
-where redacted = false and room_id = $1
-group by counterparty_mxid
-order by counterparty_mxid
+select a_mxid,
+       b_mxid,
+       sum(signed_cents)::bigint as a_owes_b_cents
+from (
+    select least(from_mxid, to_mxid) as a_mxid,
+           greatest(from_mxid, to_mxid) as b_mxid,
+           (case kind when 'owes' then amount_cents else -amount_cents end)
+             * (case when from_mxid < to_mxid then 1 else -1 end) as signed_cents
+    from ledger_entries
+    where redacted = false and room_id = $1
+) as signed
+group by a_mxid, b_mxid
+order by a_mxid, b_mxid
 "#,
     )
     .bind(room_id)
@@ -234,38 +231,10 @@ order by counterparty_mxid
     rows.into_iter()
         .map(|row| {
             Ok(Balance {
-                counterparty_mxid: row.try_get("counterparty_mxid")?,
-                balance_cents: row.try_get("balance_cents")?,
+                a_mxid: row.try_get("a_mxid")?,
+                b_mxid: row.try_get("b_mxid")?,
+                a_owes_b_cents: row.try_get("a_owes_b_cents")?,
             })
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use chrono::TimeZone;
-
-    use super::*;
-    use crate::parser::{BotCommand, parse_command};
-
-    #[test]
-    fn builds_entry_from_command() {
-        let BotCommand::Entry(command) =
-            parse_command("!purchase @cassidy:example $12.34 lunch").unwrap()
-        else {
-            panic!("expected entry command");
-        };
-        let created_at = Utc.with_ymd_and_hms(2026, 8, 16, 18, 0, 0).unwrap();
-        let entry = LedgerEntry::from_command(
-            "!room:example",
-            "$event",
-            "@bot:example",
-            command,
-            created_at,
-        );
-
-        assert_eq!(entry.kind, LedgerKind::Purchase);
-        assert_eq!(entry.amount_cents, 1234);
-        assert_eq!(entry.description, Some("lunch".to_owned()));
-    }
 }

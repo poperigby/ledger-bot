@@ -2,13 +2,17 @@
 
 Matrix ledger bot. Complete slop that shouldn't be used by anyone besides me.
 
-The bot records simple ledger events from Matrix rooms:
+The bot records who owes whom in Matrix rooms. Either side of an entry can be left out, in which case it is the sender:
 
-- `!purchase @user:server 12.34 description`
-- `!payment @user:server 12.34 description`
-- `!balance`
-- `!balance @user:server`
+- `@x !owes @y 12.34 description`: x owes y
+- `@x !owes 12.34 description`: x owes the sender
+- `!owes @y 12.34 description`: the sender owes y
+- `!paid` takes the same forms and records a payment from x to y
+- `!balance`: every outstanding balance in the room, netted per pair of people
+- `!balance @x`: balances involving x
 - `!help`
+
+Users can be full IDs (`@user:server`), bare handles like `@alex` matched against room members by user ID localpart or display name, or mention pills. Full IDs in entries must belong to current room members.
 
 Ledger entries, processed event IDs, edits, redactions, and balances are stored in PostgreSQL. Matrix client state and E2EE state are stored in the Matrix SDK SQLite store under `data_dir/matrix-store`.
 
@@ -156,6 +160,6 @@ A real smoke test needs a Matrix account, a test room, and a Postgres database.
 3. Configure Matrix auth through an access token plus `device_id`, or through password login.
 4. Allowlist the test room in `allowed_room_ids`.
 5. Start the bot.
-6. Send `!help`, then `!purchase @user:server 1.23 test`, then `!balance`.
-7. Edit the purchase message twice and confirm the balance reflects only the latest edit.
-8. Redact the original purchase message and confirm the balance changes again.
+6. Send `!help`, then `!owes @user:server 1.23 test`, then `!balance`.
+7. Edit the `!owes` message twice and confirm the balance reflects only the latest edit.
+8. Redact the original `!owes` message and confirm the balance changes again.

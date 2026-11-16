@@ -2,23 +2,28 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerKind {
-    Purchase,
-    Payment,
+    /// `from` owes `to` the amount.
+    Owes,
+    /// `from` paid `to` the amount.
+    Paid,
 }
 
 impl LedgerKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Purchase => "purchase",
-            Self::Payment => "payment",
+            Self::Owes => "owes",
+            Self::Paid => "paid",
         }
     }
 }
 
+/// `<from> !owes|!paid <to> <amount> [description]`. At least one of `from`
+/// and `to` is present; the missing side is the message's sender.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerCommand {
     pub kind: LedgerKind,
-    pub counterparty_mxid: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub amount_cents: i64,
     pub description: Option<String>,
 }
@@ -26,16 +31,19 @@ pub struct LedgerCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BotCommand {
     Entry(LedgerCommand),
-    Balance { counterparty_mxid: Option<String> },
+    Balance { user: Option<String> },
     Help,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ParseError {
-    #[error("expected !purchase, !payment, !balance, or !help")]
-    MissingCommand,
-    #[error("expected a Matrix user ID like @user:server")]
-    MissingCounterparty,
+    /// The message is ordinary chat, not addressed to the bot.
+    #[error("not a ledger command")]
+    NotACommand,
+    #[error("name at least one person, like `@user !owes 12.34` or `!owes @user 12.34`")]
+    MissingParty,
+    #[error("expected a user like @user or @user:server, got {0}")]
+    InvalidUser(String),
     #[error("expected an amount like 12.34")]
     MissingAmount,
     #[error("unexpected argument: {0}")]
@@ -46,69 +54,98 @@ pub enum ParseError {
     InvalidAmount(String),
 }
 
+const ENTRY_COMMANDS: [&str; 2] = ["!owes", "!paid"];
+
 pub fn parse_command(input: &str) -> Result<BotCommand, ParseError> {
-    let mut parts = input.trim().splitn(4, char::is_whitespace);
-    let command = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .ok_or(ParseError::MissingCommand)?;
+    let (first, rest) = next_token(input).ok_or(ParseError::NotACommand)?;
+
+    // `@user !owes ...` puts a person before the command. Anything else that
+    // starts with a mention is chat, so stay quiet unless the next word is an
+    // entry command.
+    let (from, command, rest) = if first.starts_with('@') {
+        match next_token(rest) {
+            Some((command, rest)) if ENTRY_COMMANDS.contains(&command) => {
+                (Some(parse_user(first)?), command, rest)
+            }
+            _ => return Err(ParseError::NotACommand),
+        }
+    } else {
+        (None, first, rest)
+    };
 
     match command {
-        "!purchase" | "purchase" => parse_entry(LedgerKind::Purchase, parts),
-        "!payment" | "payment" => parse_entry(LedgerKind::Payment, parts),
-        "!balance" | "balance" => parse_balance(parts),
-        "!help" | "help" => parse_help(parts),
+        "!owes" => parse_entry(LedgerKind::Owes, from, rest),
+        "!paid" => parse_entry(LedgerKind::Paid, from, rest),
+        "!balance" => parse_balance(rest),
+        "!help" => parse_help(rest),
         other if other.starts_with('!') => Err(ParseError::UnknownCommand(other.to_owned())),
-        _ => Err(ParseError::MissingCommand),
+        _ => Err(ParseError::NotACommand),
     }
 }
 
-fn parse_entry<'a>(
+/// Splits off the first whitespace-delimited token, skipping any run of
+/// leading whitespace so repeated spaces never produce empty tokens.
+fn next_token(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    if input.is_empty() {
+        return None;
+    }
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    Some((&input[..end], &input[end..]))
+}
+
+/// A user is either a full Matrix ID (`@user:server`) or a bare handle
+/// (`@user`) that the caller resolves against the room's members.
+fn parse_user(token: &str) -> Result<String, ParseError> {
+    match token.strip_prefix('@') {
+        Some(rest) if !rest.is_empty() && !rest.starts_with(':') && !rest.ends_with(':') => {
+            Ok(token.to_owned())
+        }
+        _ => Err(ParseError::InvalidUser(token.to_owned())),
+    }
+}
+
+fn parse_entry(
     kind: LedgerKind,
-    mut parts: impl Iterator<Item = &'a str>,
+    from: Option<String>,
+    rest: &str,
 ) -> Result<BotCommand, ParseError> {
-    let counterparty = parts.next().ok_or(ParseError::MissingCounterparty)?;
-    let amount = parts.next().ok_or(ParseError::MissingAmount)?;
-    let description = parts
-        .next()
-        .map(str::trim)
+    let (to, rest) = match next_token(rest) {
+        Some((token, rest)) if token.starts_with('@') => (Some(parse_user(token)?), rest),
+        _ => (None, rest),
+    };
+    if from.is_none() && to.is_none() {
+        return Err(ParseError::MissingParty);
+    }
+
+    let (amount, rest) = next_token(rest).ok_or(ParseError::MissingAmount)?;
+    let description = Some(rest.trim())
         .filter(|part| !part.is_empty())
         .map(ToOwned::to_owned);
 
-    if !counterparty.starts_with('@') || !counterparty.contains(':') {
-        return Err(ParseError::MissingCounterparty);
-    }
-
     Ok(BotCommand::Entry(LedgerCommand {
         kind,
-        counterparty_mxid: counterparty.to_owned(),
+        from,
+        to,
         amount_cents: parse_cents(amount)?,
         description,
     }))
 }
 
-fn parse_balance<'a>(mut parts: impl Iterator<Item = &'a str>) -> Result<BotCommand, ParseError> {
-    let counterparty = parts.next();
-    if let Some(extra) = parts.next() {
+fn parse_balance(rest: &str) -> Result<BotCommand, ParseError> {
+    let Some((user, rest)) = next_token(rest) else {
+        return Ok(BotCommand::Balance { user: None });
+    };
+    if let Some((extra, _)) = next_token(rest) {
         return Err(ParseError::UnexpectedArgument(extra.to_owned()));
     }
-
-    if let Some(counterparty) = counterparty {
-        if !counterparty.starts_with('@') || !counterparty.contains(':') {
-            return Err(ParseError::MissingCounterparty);
-        }
-        Ok(BotCommand::Balance {
-            counterparty_mxid: Some(counterparty.to_owned()),
-        })
-    } else {
-        Ok(BotCommand::Balance {
-            counterparty_mxid: None,
-        })
-    }
+    Ok(BotCommand::Balance {
+        user: Some(parse_user(user)?),
+    })
 }
 
-fn parse_help<'a>(mut parts: impl Iterator<Item = &'a str>) -> Result<BotCommand, ParseError> {
-    if let Some(extra) = parts.next() {
+fn parse_help(rest: &str) -> Result<BotCommand, ParseError> {
+    if let Some((extra, _)) = next_token(rest) {
         return Err(ParseError::UnexpectedArgument(extra.to_owned()));
     }
     Ok(BotCommand::Help)
@@ -158,31 +195,86 @@ pub fn parse_cents(input: &str) -> Result<i64, ParseError> {
 mod tests {
     use super::*;
 
+    fn entry(input: &str) -> LedgerCommand {
+        match parse_command(input).unwrap() {
+            BotCommand::Entry(command) => command,
+            other => panic!("expected an entry, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn parses_purchase() {
-        let command = parse_command("!purchase @alex:example $12.30 groceries").unwrap();
+    fn parses_both_parties() {
         assert_eq!(
-            command,
-            BotCommand::Entry(LedgerCommand {
-                kind: LedgerKind::Purchase,
-                counterparty_mxid: "@alex:example".to_owned(),
+            entry("@alex:example !owes @blair 12.30 groceries"),
+            LedgerCommand {
+                kind: LedgerKind::Owes,
+                from: Some("@alex:example".to_owned()),
+                to: Some("@blair".to_owned()),
                 amount_cents: 1230,
                 description: Some("groceries".to_owned()),
-            })
+            }
         );
     }
 
     #[test]
-    fn parses_payment_without_description() {
-        let command = parse_command("payment @alex:example 12").unwrap();
+    fn missing_side_is_left_for_the_sender() {
+        let command = entry("@shwilson2 !owes 24 Deodorant pack");
+        assert_eq!(command.from.as_deref(), Some("@shwilson2"));
+        assert_eq!(command.to, None);
+
+        let command = entry("!paid @shwilson2 $24");
+        assert_eq!(command.kind, LedgerKind::Paid);
+        assert_eq!(command.from, None);
+        assert_eq!(command.to.as_deref(), Some("@shwilson2"));
+        assert_eq!(command.description, None);
+    }
+
+    #[test]
+    fn requires_a_party() {
+        assert_eq!(parse_command("!owes 24"), Err(ParseError::MissingParty));
+    }
+
+    #[test]
+    fn tolerates_repeated_whitespace() {
         assert_eq!(
-            command,
-            BotCommand::Entry(LedgerCommand {
-                kind: LedgerKind::Payment,
-                counterparty_mxid: "@alex:example".to_owned(),
-                amount_cents: 1200,
-                description: None,
-            })
+            entry("  @alex   !owes  @blair:example   24  Deodorant pack "),
+            LedgerCommand {
+                kind: LedgerKind::Owes,
+                from: Some("@alex".to_owned()),
+                to: Some("@blair:example".to_owned()),
+                amount_cents: 2400,
+                description: Some("Deodorant pack".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_chat_that_starts_with_a_mention() {
+        assert_eq!(
+            parse_command("@alex want lunch?"),
+            Err(ParseError::NotACommand)
+        );
+        assert_eq!(parse_command("@alex !!!"), Err(ParseError::NotACommand));
+        assert_eq!(
+            parse_command("@alex !balance"),
+            Err(ParseError::NotACommand)
+        );
+        assert_eq!(parse_command("owes @alex 5"), Err(ParseError::NotACommand));
+    }
+
+    #[test]
+    fn rejects_bad_users() {
+        assert_eq!(
+            parse_command("!owes @ 24"),
+            Err(ParseError::InvalidUser("@".to_owned()))
+        );
+        assert_eq!(
+            parse_command("@alex: !owes 24"),
+            Err(ParseError::InvalidUser("@alex:".to_owned()))
+        );
+        assert_eq!(
+            parse_command("!balance alex"),
+            Err(ParseError::InvalidUser("alex".to_owned()))
         );
     }
 
@@ -190,14 +282,12 @@ mod tests {
     fn parses_balance() {
         assert_eq!(
             parse_command("!balance").unwrap(),
-            BotCommand::Balance {
-                counterparty_mxid: None
-            }
+            BotCommand::Balance { user: None }
         );
         assert_eq!(
-            parse_command("balance @alex:example").unwrap(),
+            parse_command("!balance @alex").unwrap(),
             BotCommand::Balance {
-                counterparty_mxid: Some("@alex:example".to_owned())
+                user: Some("@alex".to_owned())
             }
         );
     }
@@ -205,6 +295,14 @@ mod tests {
     #[test]
     fn parses_help() {
         assert_eq!(parse_command("!help").unwrap(), BotCommand::Help);
+    }
+
+    #[test]
+    fn rejects_unknown_commands() {
+        assert_eq!(
+            parse_command("!purchase @alex 5"),
+            Err(ParseError::UnknownCommand("!purchase".to_owned()))
+        );
     }
 
     #[test]
