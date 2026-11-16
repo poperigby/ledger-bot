@@ -28,10 +28,24 @@ pub struct LedgerCommand {
     pub description: Option<String>,
 }
 
+/// How much of each pair's history `!balance` lists under the totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalanceDetail {
+    /// Totals only.
+    Summary,
+    /// Entries since the pair was last settled up.
+    SinceSettled,
+    /// Every entry ever recorded.
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BotCommand {
     Entry(LedgerCommand),
-    Balance { user: Option<String> },
+    Balance {
+        user: Option<String>,
+        detail: BalanceDetail,
+    },
     Help,
 }
 
@@ -132,15 +146,23 @@ fn parse_entry(
     }))
 }
 
-fn parse_balance(rest: &str) -> Result<BotCommand, ParseError> {
-    let Some((user, rest)) = next_token(rest) else {
-        return Ok(BotCommand::Balance { user: None });
-    };
-    if let Some((extra, _)) = next_token(rest) {
-        return Err(ParseError::UnexpectedArgument(extra.to_owned()));
+/// `!balance [@user] [details|all]`, with the arguments in either order.
+fn parse_balance(mut rest: &str) -> Result<BotCommand, ParseError> {
+    let mut user = None;
+    let mut detail = None;
+    while let Some((token, after)) = next_token(rest) {
+        rest = after;
+        match token {
+            "details" if detail.is_none() => detail = Some(BalanceDetail::SinceSettled),
+            "all" if detail.is_none() => detail = Some(BalanceDetail::All),
+            "details" | "all" => return Err(ParseError::UnexpectedArgument(token.to_owned())),
+            _ if user.is_none() => user = Some(parse_user(token)?),
+            _ => return Err(ParseError::UnexpectedArgument(token.to_owned())),
+        }
     }
     Ok(BotCommand::Balance {
-        user: Some(parse_user(user)?),
+        user,
+        detail: detail.unwrap_or(BalanceDetail::Summary),
     })
 }
 
@@ -282,13 +304,50 @@ mod tests {
     fn parses_balance() {
         assert_eq!(
             parse_command("!balance").unwrap(),
-            BotCommand::Balance { user: None }
+            BotCommand::Balance {
+                user: None,
+                detail: BalanceDetail::Summary,
+            }
         );
         assert_eq!(
             parse_command("!balance @alex").unwrap(),
             BotCommand::Balance {
-                user: Some("@alex".to_owned())
+                user: Some("@alex".to_owned()),
+                detail: BalanceDetail::Summary,
             }
+        );
+        assert_eq!(
+            parse_command("!balance details").unwrap(),
+            BotCommand::Balance {
+                user: None,
+                detail: BalanceDetail::SinceSettled,
+            }
+        );
+        assert_eq!(
+            parse_command("!balance all @alex").unwrap(),
+            BotCommand::Balance {
+                user: Some("@alex".to_owned()),
+                detail: BalanceDetail::All,
+            }
+        );
+        assert_eq!(
+            parse_command("!balance @alex details").unwrap(),
+            BotCommand::Balance {
+                user: Some("@alex".to_owned()),
+                detail: BalanceDetail::SinceSettled,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_balance_arguments() {
+        assert_eq!(
+            parse_command("!balance details all"),
+            Err(ParseError::UnexpectedArgument("all".to_owned()))
+        );
+        assert_eq!(
+            parse_command("!balance @alex @blair"),
+            Err(ParseError::UnexpectedArgument("@blair".to_owned()))
         );
     }
 

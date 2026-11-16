@@ -10,6 +10,8 @@ The bot records who owes whom in Matrix rooms. Either side of an entry can be le
 - `!paid` takes the same forms and records a payment from x to y
 - `!balance`: every outstanding balance in the room, netted per pair of people
 - `!balance @x`: balances involving x
+- `!balance details`: each balance with a table of the entries since that pair last settled up (combine with `@x` in either order)
+- `!balance all`: like `details`, but lists every entry ever recorded
 - `!help`
 
 Users can be full IDs (`@user:server`), bare handles like `@alex` matched against room members by user ID localpart or display name, or mention pills. Full IDs in entries must belong to current room members.

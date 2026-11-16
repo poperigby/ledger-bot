@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
@@ -204,6 +206,33 @@ where ledger_entries.redacted = false
     Ok(result.rows_affected() == 1)
 }
 
+/// Net balance between two users in the room. Positive means `a_mxid` owes
+/// `b_mxid`.
+pub async fn pair_balance(
+    pool: &PgPool,
+    room_id: &str,
+    a_mxid: &str,
+    b_mxid: &str,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"
+select coalesce(sum(
+           (case kind when 'owes' then amount_cents else -amount_cents end)
+             * (case when from_mxid = $2 then 1 else -1 end)
+       ), 0)::bigint
+from ledger_entries
+where redacted = false
+  and room_id = $1
+  and ((from_mxid = $2 and to_mxid = $3) or (from_mxid = $3 and to_mxid = $2))
+"#,
+    )
+    .bind(room_id)
+    .bind(a_mxid)
+    .bind(b_mxid)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Nets every pair of users in the room. `!owes` moves the debt towards
 /// `from` owing `to`; `!paid` moves it back.
 pub async fn balances(pool: &PgPool, room_id: &str) -> anyhow::Result<Vec<Balance>> {
@@ -237,4 +266,156 @@ order by a_mxid, b_mxid
             })
         })
         .collect()
+}
+
+/// One pair's net balance plus the entries behind it, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairHistory {
+    pub balance: Balance,
+    pub entries: Vec<LedgerEntry>,
+}
+
+/// How much `entry` moves the debt towards `a_mxid` owing the other party.
+pub fn signed_cents(entry: &LedgerEntry, a_mxid: &str) -> i64 {
+    let amount = match entry.kind {
+        LedgerKind::Owes => entry.amount_cents,
+        LedgerKind::Paid => -entry.amount_cents,
+    };
+    if entry.from_mxid == a_mxid {
+        amount
+    } else {
+        -amount
+    }
+}
+
+/// Every unredacted entry in the room, oldest first.
+pub async fn entries(pool: &PgPool, room_id: &str) -> anyhow::Result<Vec<LedgerEntry>> {
+    let rows = sqlx::query(
+        r#"
+select room_id, matrix_event_id, kind, actor_mxid, from_mxid, to_mxid,
+       amount_cents, description, created_at
+from ledger_entries
+where redacted = false and room_id = $1
+order by created_at, id
+"#,
+    )
+    .bind(room_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let kind: String = row.try_get("kind")?;
+            Ok(LedgerEntry {
+                room_id: row.try_get("room_id")?,
+                matrix_event_id: row.try_get("matrix_event_id")?,
+                kind: match kind.as_str() {
+                    "owes" => LedgerKind::Owes,
+                    "paid" => LedgerKind::Paid,
+                    other => anyhow::bail!("unknown ledger entry kind {other}"),
+                },
+                actor_mxid: row.try_get("actor_mxid")?,
+                from_mxid: row.try_get("from_mxid")?,
+                to_mxid: row.try_get("to_mxid")?,
+                amount_cents: row.try_get("amount_cents")?,
+                description: row.try_get("description")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Groups entries, which must be oldest first, by pair of users. With
+/// `since_settled`, each pair keeps only the entries after its balance last
+/// reached zero, so a settled pair keeps none.
+pub fn histories(entries: Vec<LedgerEntry>, since_settled: bool) -> Vec<PairHistory> {
+    let mut pairs: BTreeMap<(String, String), PairHistory> = BTreeMap::new();
+    for entry in entries {
+        let (a, b) = if entry.from_mxid < entry.to_mxid {
+            (&entry.from_mxid, &entry.to_mxid)
+        } else {
+            (&entry.to_mxid, &entry.from_mxid)
+        };
+        let pair = pairs
+            .entry((a.clone(), b.clone()))
+            .or_insert_with(|| PairHistory {
+                balance: Balance {
+                    a_mxid: a.clone(),
+                    b_mxid: b.clone(),
+                    a_owes_b_cents: 0,
+                },
+                entries: Vec::new(),
+            });
+        pair.balance.a_owes_b_cents += signed_cents(&entry, &pair.balance.a_mxid);
+        pair.entries.push(entry);
+        if since_settled && pair.balance.a_owes_b_cents == 0 {
+            pair.entries.clear();
+        }
+    }
+    pairs.into_values().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(kind: LedgerKind, from: &str, to: &str, amount_cents: i64) -> LedgerEntry {
+        LedgerEntry {
+            room_id: "!room:example".to_owned(),
+            matrix_event_id: format!("${from}{to}{amount_cents}"),
+            kind,
+            actor_mxid: from.to_owned(),
+            from_mxid: from.to_owned(),
+            to_mxid: to.to_owned(),
+            amount_cents,
+            description: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn nets_each_pair() {
+        let pairs = histories(
+            vec![
+                entry(LedgerKind::Owes, "@b", "@a", 2400),
+                entry(LedgerKind::Owes, "@b", "@a", 600),
+                entry(LedgerKind::Owes, "@a", "@b", 5000),
+                entry(LedgerKind::Owes, "@a", "@c", 100),
+            ],
+            true,
+        );
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].balance.a_owes_b_cents, 2000);
+        assert_eq!(pairs[0].entries.len(), 3);
+        assert_eq!(pairs[1].balance.b_mxid, "@c");
+    }
+
+    #[test]
+    fn drops_entries_before_the_last_settle_up() {
+        let entries = vec![
+            entry(LedgerKind::Owes, "@a", "@b", 1000),
+            entry(LedgerKind::Paid, "@a", "@b", 1000),
+            entry(LedgerKind::Owes, "@b", "@a", 300),
+        ];
+
+        let pairs = histories(entries.clone(), true);
+        assert_eq!(pairs[0].balance.a_owes_b_cents, -300);
+        assert_eq!(pairs[0].entries, entries[2..]);
+
+        let pairs = histories(entries.clone(), false);
+        assert_eq!(pairs[0].entries, entries);
+    }
+
+    #[test]
+    fn settled_pair_keeps_no_entries() {
+        let pairs = histories(
+            vec![
+                entry(LedgerKind::Owes, "@a", "@b", 1000),
+                entry(LedgerKind::Owes, "@b", "@a", 1000),
+            ],
+            true,
+        );
+        assert_eq!(pairs[0].balance.a_owes_b_cents, 0);
+        assert!(pairs[0].entries.is_empty());
+    }
 }

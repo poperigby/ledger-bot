@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use matrix_sdk::{
     Client, Room, RoomMemberships, RoomState,
     authentication::{
@@ -39,8 +39,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::{Config, MatrixConfig, resolve_optional_secret},
-    ledger::{self, Balance, LedgerEntry},
-    parser::{BotCommand, ParseError, parse_command},
+    ledger::{self, Balance, LedgerEntry, PairHistory},
+    parser::{BalanceDetail, BotCommand, ParseError, parse_command},
 };
 
 #[derive(Clone)]
@@ -350,7 +350,7 @@ async fn process_room_message(
 
     let command = match command {
         BotCommand::Entry(command) => command,
-        BotCommand::Balance { user } => {
+        BotCommand::Balance { user, detail } => {
             let user = match user {
                 Some(raw) => match resolve_user(room, &raw, &state.bot_user_id, false).await? {
                     Ok(user_id) => Some(user_id),
@@ -361,16 +361,19 @@ async fn process_room_message(
                 },
                 None => None,
             };
-            let balances = ledger::balances(&state.pool, room_id.as_str()).await?;
-            reply(
-                room,
-                format_balances(&balances, user.as_ref().map(|user| user.as_str())),
-            )
-            .await?;
+            let user = user.as_ref().map(|user| user.as_str());
+            if detail == BalanceDetail::Summary {
+                let balances = ledger::balances(&state.pool, room_id.as_str()).await?;
+                reply(room, format_balances(&balances, user)).await?;
+            } else {
+                let entries = ledger::entries(&state.pool, room_id.as_str()).await?;
+                let pairs = ledger::histories(entries, detail == BalanceDetail::SinceSettled);
+                reply_html(room, format_balance_details(&pairs, user, Utc::now())).await?;
+            }
             return Ok(());
         }
         BotCommand::Help => {
-            reply(room, help_text()).await?;
+            reply_html(room, help_text()).await?;
             return Ok(());
         }
     };
@@ -446,7 +449,17 @@ async fn process_room_message(
     };
 
     if let Some(entry) = changed {
-        reply(room, format_recorded(&entry)).await?;
+        let (a, b) = if entry.from_mxid < entry.to_mxid {
+            (&entry.from_mxid, &entry.to_mxid)
+        } else {
+            (&entry.to_mxid, &entry.from_mxid)
+        };
+        let a_owes_b_cents = ledger::pair_balance(&state.pool, room_id.as_str(), a, b).await?;
+        reply_html(
+            room,
+            format_recorded(&entry, replaces_event_id.is_some(), a_owes_b_cents),
+        )
+        .await?;
     }
 
     Ok(())
@@ -527,30 +540,118 @@ async fn reply(room: &Room, text: impl Into<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn help_text() -> &'static str {
-    "Commands:\n\
-     @x !owes @y 12.34 description: x owes y\n\
-     @x !owes 12.34 description: x owes you\n\
-     !owes @y 12.34 description: you owe y\n\
-     !paid works the same way, for payments\n\
-     !balance: every balance in this room\n\
-     !balance @x: balances involving x\n\
-     Users can be @user:server, or a bare @user that matches one room member."
+async fn reply_html(room: &Room, (plain, html): (String, String)) -> anyhow::Result<()> {
+    room.send(RoomMessageEventContent::notice_html(plain, html))
+        .await?;
+    Ok(())
 }
 
-fn format_recorded(entry: &LedgerEntry) -> String {
-    let mut message = format!(
-        "Recorded: {} {} {} {}",
-        entry.from_mxid,
-        entry.kind.as_str(),
-        entry.to_mxid,
-        format_cents(entry.amount_cents)
+/// A titled table of commands: title, second column heading, rows.
+type HelpSection = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+const HELP_SECTIONS: [HelpSection; 2] = [
+    (
+        "Recording",
+        "Meaning",
+        &[
+            ("!owes @y 12.34 lunch", "you owe y"),
+            ("@x !owes 12.34 lunch", "x owes you"),
+            ("@x !owes @y 12.34 lunch", "x owes y"),
+            ("!paid …", "same forms, for payments"),
+        ],
+    ),
+    (
+        "Balances",
+        "Shows",
+        &[
+            ("!balance", "who owes whom"),
+            ("!balance @x", "only x's balances"),
+            ("!balance details", "entries since last settled up"),
+            ("!balance all", "every entry ever"),
+        ],
+    ),
+];
+
+const HELP_FOOTER: &str = "Users can be @user:server, or @user if it matches one person in the \
+     room. Edit or delete your message to change or remove an entry.";
+
+/// The plain-text and HTML bodies of `!help`.
+fn help_text() -> (String, String) {
+    let mut plain = String::new();
+    let mut html = String::new();
+    for (title, meaning, commands) in HELP_SECTIONS {
+        let width = commands
+            .iter()
+            .map(|(command, _)| command.chars().count())
+            .max()
+            .unwrap_or(0);
+        plain.push_str(title);
+        html.push_str(&format!(
+            "<p><strong>{title}</strong></p>\
+             <table><thead><tr><th>Command</th><th>{meaning}</th></tr></thead><tbody>"
+        ));
+        for (command, description) in commands {
+            plain.push_str(&format!("\n  {command:width$}  {description}"));
+            html.push_str(&format!(
+                "<tr><td><code>{}</code></td><td>{}</td></tr>",
+                escape_html(command),
+                escape_html(description)
+            ));
+        }
+        plain.push_str("\n\n");
+        html.push_str("</tbody></table>");
+    }
+    plain.push_str(HELP_FOOTER);
+    html.push_str(
+        "<p>Users can be <code>@user:server</code>, or <code>@user</code> if it matches one \
+         person in the room. Edit or delete your message to change or remove an entry.</p>",
+    );
+    (plain, html)
+}
+
+/// Confirms a new or edited entry. `a_owes_b_cents` is the pair's balance
+/// afterwards, with `a_mxid` the party that sorts first.
+fn format_recorded(entry: &LedgerEntry, edited: bool, a_owes_b_cents: i64) -> (String, String) {
+    let (icon, verb) = if edited {
+        ("✏️", "Updated: ")
+    } else {
+        ("✅", "")
+    };
+    let from = localpart(&entry.from_mxid);
+    let to = localpart(&entry.to_mxid);
+    let amount = format_cents(entry.amount_cents);
+    let kind = entry.kind.as_str();
+
+    let mut plain = format!("{icon} {verb}{from} {kind} {to} {amount}");
+    let mut html = format!(
+        "{icon} {verb}<strong>{}</strong> {kind} <strong>{}</strong> <strong>{}</strong>",
+        escape_html(from),
+        escape_html(to),
+        escape_html(&amount)
     );
     if let Some(description) = &entry.description {
-        message.push_str("\nDescription: ");
-        message.push_str(description);
+        plain.push_str(&format!(" — {description}"));
+        html.push_str(&format!(" — {}", escape_html(description)));
     }
-    message
+
+    let (a, b) = if entry.from_mxid < entry.to_mxid {
+        (from, to)
+    } else {
+        (to, from)
+    };
+    let balance = match a_owes_b_cents {
+        0 => format!("{a} and {b} are now settled up"),
+        cents if cents > 0 => format!("{a} now owes {b} {}", format_cents(cents)),
+        cents => format!("{b} now owes {a} {}", format_cents(-cents)),
+    };
+    plain.push('\n');
+    plain.push_str(&balance);
+    html.push_str(&format!("<br><sub>{}</sub>", escape_html(&balance)));
+    (plain, html)
 }
 
 /// Lists who owes whom. With `user`, only pairs involving that user are
@@ -562,31 +663,197 @@ fn format_balances(balances: &[Balance], user: Option<&str>) -> String {
             Some(user) => balance.a_mxid == user || balance.b_mxid == user,
             None => balance.a_owes_b_cents != 0,
         })
-        .map(|balance| {
-            let (debtor, creditor) = if balance.a_owes_b_cents >= 0 {
-                (&balance.a_mxid, &balance.b_mxid)
-            } else {
-                (&balance.b_mxid, &balance.a_mxid)
-            };
-            if balance.a_owes_b_cents == 0 {
-                format!("{debtor} and {creditor} are settled up")
-            } else {
-                format!(
-                    "{debtor} owes {creditor} {}",
-                    format_cents(balance.a_owes_b_cents.abs())
-                )
-            }
-        })
+        .map(balance_line)
         .collect::<Vec<_>>();
 
-    let heading = match user {
-        Some(user) => format!("Balances for {user}"),
-        None => "Balances".to_owned(),
-    };
+    let heading = balances_heading(user);
     if lines.is_empty() {
         return format!("{heading}\nNothing owed.");
     }
     format!("{heading}\n{}", lines.join("\n"))
+}
+
+fn balances_heading(user: Option<&str>) -> String {
+    match user {
+        Some(user) => format!("Balances for {user}"),
+        None => "Balances".to_owned(),
+    }
+}
+
+fn balance_line(balance: &Balance) -> String {
+    let (debtor, creditor) = if balance.a_owes_b_cents >= 0 {
+        (&balance.a_mxid, &balance.b_mxid)
+    } else {
+        (&balance.b_mxid, &balance.a_mxid)
+    };
+    if balance.a_owes_b_cents == 0 {
+        format!("{debtor} and {creditor} are settled up")
+    } else {
+        format!(
+            "{debtor} owes {creditor} {}",
+            format_cents(balance.a_owes_b_cents.abs())
+        )
+    }
+}
+
+/// One table row of `!balance details`.
+struct DetailRow {
+    date: String,
+    entry: String,
+    amount: String,
+    description: String,
+}
+
+/// Lists each pair's balance with a table of the entries behind it. Amounts
+/// are signed relative to the pair's net balance, so they add up to the
+/// total. Returns the plain-text body and the HTML body.
+fn format_balance_details(
+    pairs: &[PairHistory],
+    user: Option<&str>,
+    now: DateTime<Utc>,
+) -> (String, String) {
+    let pairs: Vec<_> = pairs
+        .iter()
+        .filter(|pair| match user {
+            Some(user) => pair.balance.a_mxid == user || pair.balance.b_mxid == user,
+            None => pair.balance.a_owes_b_cents != 0 || !pair.entries.is_empty(),
+        })
+        .collect();
+
+    let heading = balances_heading(user);
+    let mut plain = heading.clone();
+    let mut html = format!("<p><strong>{}</strong></p>", escape_html(&heading));
+    if pairs.is_empty() {
+        plain.push_str("\nNothing owed.");
+        html.push_str("<p>Nothing owed.</p>");
+        return (plain, html);
+    }
+
+    for pair in pairs {
+        let line = balance_line(&pair.balance);
+        plain.push_str("\n\n");
+        plain.push_str(&line);
+        html.push_str(&format!("<p><strong>{}</strong></p>", escape_html(&line)));
+        if pair.entries.is_empty() {
+            continue;
+        }
+
+        let direction = if pair.balance.a_owes_b_cents < 0 {
+            -1
+        } else {
+            1
+        };
+        let rows: Vec<_> = pair
+            .entries
+            .iter()
+            .map(|entry| DetailRow {
+                date: format_date(entry.created_at, now),
+                entry: format!(
+                    "{} {} {}",
+                    localpart(&entry.from_mxid),
+                    entry.kind.as_str(),
+                    localpart(&entry.to_mxid)
+                ),
+                amount: format_signed_cents(
+                    ledger::signed_cents(entry, &pair.balance.a_mxid) * direction,
+                ),
+                description: entry.description.clone().unwrap_or_default(),
+            })
+            .collect();
+        let total = format_cents(pair.balance.a_owes_b_cents.abs());
+
+        plain.push_str(&plain_detail_table(&rows, &total));
+        html.push_str(&html_detail_table(&rows, &total));
+    }
+    (plain, html)
+}
+
+fn plain_detail_table(rows: &[DetailRow], total: &str) -> String {
+    let width = |text: &str| text.chars().count();
+    let date_width = rows.iter().map(|row| width(&row.date)).max().unwrap_or(0);
+    let entry_width = rows.iter().map(|row| width(&row.entry)).max().unwrap_or(0);
+    let amount_width = rows
+        .iter()
+        .map(|row| width(&row.amount))
+        .chain([width(total)])
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    for row in rows {
+        let line = format!(
+            "  {:date_width$}  {:entry_width$}  {:>amount_width$}  {}",
+            row.date, row.entry, row.amount, row.description
+        );
+        out.push('\n');
+        out.push_str(line.trim_end());
+    }
+    let label_width = date_width + 2 + entry_width;
+    out.push_str(&format!(
+        "\n  {}\n  {:label_width$}  {total:>amount_width$}",
+        "-".repeat(label_width + 2 + amount_width),
+        "Total"
+    ));
+    out
+}
+
+/// Matrix clients strip `tfoot` and `colspan`, so the total is a header-style
+/// row in its own body, which clients draw apart from the entries.
+fn html_detail_table(rows: &[DetailRow], total: &str) -> String {
+    let mut out = String::from(
+        "<table><thead><tr><th>Date</th><th>Entry</th><th>Amount</th><th>Description</th></tr></thead><tbody>",
+    );
+    for row in rows {
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&row.date),
+            escape_html(&row.entry),
+            escape_html(&row.amount),
+            escape_html(&row.description)
+        ));
+    }
+    out.push_str(&format!(
+        "</tbody><tbody><tr><th>Total</th><th></th><th>{}</th><th></th></tr></tbody></table>",
+        escape_html(total)
+    ));
+    out
+}
+
+/// `Nov 14`, with the year added for dates outside the current year.
+fn format_date(date: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    if date.year() == now.year() {
+        date.format("%b %-d").to_string()
+    } else {
+        date.format("%b %-d, %Y").to_string()
+    }
+}
+
+fn localpart(mxid: &str) -> &str {
+    let mxid = mxid.strip_prefix('@').unwrap_or(mxid);
+    mxid.split_once(':')
+        .map_or(mxid, |(localpart, _)| localpart)
+}
+
+fn format_signed_cents(amount_cents: i64) -> String {
+    if amount_cents > 0 {
+        format!("+{}", format_cents(amount_cents))
+    } else {
+        format_cents(amount_cents)
+    }
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn format_cents(amount_cents: i64) -> String {
@@ -939,6 +1206,70 @@ mod tests {
         );
     }
 
+    fn detail_entry(from: &str, to: &str, amount_cents: i64, description: &str) -> LedgerEntry {
+        LedgerEntry {
+            room_id: "!room:example".to_owned(),
+            matrix_event_id: format!("${description}"),
+            kind: crate::parser::LedgerKind::Owes,
+            actor_mxid: from.to_owned(),
+            from_mxid: from.to_owned(),
+            to_mxid: to.to_owned(),
+            amount_cents,
+            description: Some(description.to_owned()),
+            created_at: "2026-11-14T12:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn formats_balance_details() {
+        let me = "@poperigby:haddock.cc";
+        let them = "@shwilson2:matrix.org";
+        let pairs = ledger::histories(
+            vec![
+                detail_entry(me, them, 2400, "Deodorant"),
+                detail_entry(me, them, 600, "Headphones <cable>"),
+                detail_entry(them, me, 5000, "Teriyaki"),
+            ],
+            true,
+        );
+        let now = "2026-11-16T00:00:00Z".parse().unwrap();
+        let (plain, html) = format_balance_details(&pairs, None, now);
+
+        assert_eq!(
+            plain,
+            "Balances\n\
+             \n\
+             @shwilson2:matrix.org owes @poperigby:haddock.cc $20.00\n  \
+             Nov 14  poperigby owes shwilson2  -$24.00  Deodorant\n  \
+             Nov 14  poperigby owes shwilson2   -$6.00  Headphones <cable>\n  \
+             Nov 14  shwilson2 owes poperigby  +$50.00  Teriyaki\n  \
+             -----------------------------------------\n  \
+             Total                              $20.00"
+        );
+        assert!(html.contains("<td>Headphones &lt;cable&gt;</td>"));
+        assert!(html.contains("<th>Total</th><th></th><th>$20.00</th>"));
+    }
+
+    #[test]
+    fn details_hide_settled_pairs_unless_asked_about() {
+        let pairs = ledger::histories(
+            vec![
+                detail_entry("@a:x", "@b:x", 500, "lunch"),
+                detail_entry("@b:x", "@a:x", 500, "dinner"),
+            ],
+            true,
+        );
+        let now = Utc::now();
+        assert_eq!(
+            format_balance_details(&pairs, None, now).0,
+            "Balances\nNothing owed."
+        );
+        assert_eq!(
+            format_balance_details(&pairs, Some("@a:x"), now).0,
+            "Balances for @a:x\n\n@a:x and @b:x are settled up"
+        );
+    }
+
     #[test]
     fn formats_recorded_entry() {
         let entry = LedgerEntry {
@@ -953,9 +1284,39 @@ mod tests {
             created_at: Utc::now(),
         };
 
+        let (plain, html) = format_recorded(&entry, false, 2600);
         assert_eq!(
-            format_recorded(&entry),
-            "Recorded: @alex:example owes @blair:example $12.34\nDescription: lunch"
+            plain,
+            "✅ alex owes blair $12.34 — lunch\nalex now owes blair $26.00"
+        );
+        assert_eq!(
+            html,
+            "✅ <strong>alex</strong> owes <strong>blair</strong> <strong>$12.34</strong> — lunch\
+             <br><sub>alex now owes blair $26.00</sub>"
+        );
+
+        let entry = LedgerEntry {
+            from_mxid: "@blair:example".to_owned(),
+            to_mxid: "@alex:example".to_owned(),
+            description: None,
+            ..entry
+        };
+        assert_eq!(
+            format_recorded(&entry, true, -500).0,
+            "✏️ Updated: blair owes alex $12.34\nblair now owes alex $5.00"
+        );
+        assert_eq!(
+            format_recorded(&entry, true, 0).0,
+            "✏️ Updated: blair owes alex $12.34\nalex and blair are now settled up"
+        );
+    }
+
+    #[test]
+    fn formats_help() {
+        let (plain, html) = help_text();
+        assert!(plain.starts_with("Recording\n  !owes @y 12.34 lunch     you owe y\n"));
+        assert!(
+            html.contains("<tr><td><code>!balance @x</code></td><td>only x's balances</td></tr>")
         );
     }
 
