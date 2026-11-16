@@ -90,6 +90,7 @@
                 }:
                 let
                     cfg = config.services.ledger-bot;
+                    settingsFormat = pkgs.formats.toml { };
                 in
                 {
                     options.services.ledger-bot = {
@@ -101,10 +102,47 @@
                             description = "ledger-bot package to run.";
                         };
 
+                        settings = lib.mkOption {
+                            type = lib.types.submodule {
+                                freeformType = settingsFormat.type;
+
+                                options.data_dir = lib.mkOption {
+                                    type = lib.types.str;
+                                    default = cfg.dataDir;
+                                    defaultText = lib.literalExpression "config.services.ledger-bot.dataDir";
+                                    description = "Directory for Matrix SDK store and Matrix session state.";
+                                };
+                            };
+                            default = { };
+                            example = lib.literalExpression ''
+                                {
+                                  matrix = {
+                                    homeserver_url = "https://matrix.example";
+                                    user_id = "@ledger-bot:example";
+                                    device_id = "REPLACEDEVICE";
+                                    allowed_inviter_mxids = [ "@admin:example" ];
+                                    allowed_room_ids = [ "!room:example" ];
+                                    access_token.file = "/run/secrets/ledger-bot/matrix-access-token";
+                                  };
+                                  postgres = {
+                                    max_connections = 5;
+                                    database_url.file = "/run/secrets/ledger-bot/database-url";
+                                  };
+                                }
+                            '';
+                            description = ''
+                                ledger-bot configuration, rendered to TOML. See config.example.toml
+                                for the available fields. Secrets must be referenced by file path or
+                                passed through `environmentFile`, not inlined. Ignored when
+                                `configFile` is set explicitly.
+                            '';
+                        };
+
                         configFile = lib.mkOption {
                             type = lib.types.path;
-                            default = "/etc/ledger-bot/config.toml";
-                            description = "Path to the ledger-bot TOML config file.";
+                            default = settingsFormat.generate "ledger-bot-config.toml" cfg.settings;
+                            defaultText = lib.literalExpression "generated from config.services.ledger-bot.settings";
+                            description = "Path to the ledger-bot TOML config file. Defaults to a file generated from `settings`.";
                         };
 
                         environmentFile = lib.mkOption {
